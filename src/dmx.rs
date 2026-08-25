@@ -27,7 +27,7 @@ impl DmxUniverse {
     }
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord)]
 pub struct DmxChannel(NonZeroU16);
 
 /// A human-indexed (1..=512) DMX channel number
@@ -50,10 +50,77 @@ impl DmxChannel {
     pub const fn as_idx(&self) -> usize {
         self.0.get() as usize - 1
     }
+
+    #[inline]
+    pub const fn raw(&self) -> u16 {
+        self.0.get()
+    }
 }
 
 impl std::fmt::Display for DmxChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// A constant time O(1), memory efficent, fast, representation of channel selection,
+/// superior to a vec or hashset for this usecase
+pub struct DmxChannelSelectionMask {
+    bits: [u64; 8] // 64 bytes, 512bits
+}
+
+impl DmxChannelSelectionMask {
+    pub const fn default() -> Self {
+        Self {
+            bits: [0; 8]
+        }
+    }
+
+    #[inline]
+    pub const fn get(&self, channel: DmxChannel) -> bool {
+        let index = channel.as_idx();
+        (self.bits[index / 64] & (1 << (index % 64))) != 0
+    }
+
+    pub const fn set_true(&mut self, channel: DmxChannel) {
+        let index = channel.as_idx();
+        self.bits[index / 64] |= 1 << (index % 64);
+    }
+
+    pub const fn set_false(&mut self, channel: DmxChannel) {
+        let index = channel.as_idx();
+        self.bits[index / 64] &= !(1 << (index % 64));
+    }
+
+    pub const fn toggle(&mut self, channel: DmxChannel) {
+        let index = channel.as_idx();
+        self.bits[index / 64] ^= 1 << (index % 64);
+    }
+
+    pub const fn set_true_excl(&mut self, channel: DmxChannel) {
+        self.clear();
+        self.set_true(channel);
+    }
+
+    pub const fn clear(&mut self) {
+        self.bits = [0; 8]
+    }
+
+    /// a more idiomatic standalone iterator would probably look something like this:
+    /// ```rust
+    /// pub fn iter(&self) -> impl Iterator<Item = DmxChannel> + '_ {
+    ///     (1..=512)
+    ///         .filter_map(DmxChannel::new)
+    ///         .filter(|&channel| self.get(channel))
+    /// }
+    /// ```
+    /// However, this has the issue of constructing a DmxChannel for each of the 512 channels,
+    /// which is very inneficient, thus the following mess is required
+    pub fn iter(&self) -> impl Iterator<Item = DmxChannel> + '_ {
+        (0..512)
+            .filter(|&i| {
+                (self.bits[i / 64] & (1 << (i % 64))) != 0 // essentially a manual is_bit_set()
+            })
+            .map(|i| DmxChannel::new(i as u16 + 1).unwrap())
     }
 }

@@ -16,7 +16,7 @@ use iced::{
     },
 };
 
-use crate::dmx::{DmxChannel, DmxUniverse};
+use crate::dmx::{DmxChannel, DmxChannelSelectionMask, DmxUniverse};
 
 mod artnet;
 mod net;
@@ -35,8 +35,9 @@ fn main() -> iced::Result {
 
 struct DMXDirect {
     pub universe: DmxUniverse,
-    pub selected_channels: Vec<DmxChannel>,
-    pub multi_select: bool,
+    pub selected_channels: DmxChannelSelectionMask,
+    pub last_channel: Option<DmxChannel>, // 2 bytes, niche optimized with 0
+    pub select_mode: ChannelSelectionMode,
     pub slider_value: u8,
 }
 
@@ -44,25 +45,33 @@ impl DMXDirect {
     pub const fn default() -> Self {
         Self {
             universe: DmxUniverse::default(),
-            selected_channels: Vec::new(),
-            multi_select: false,
+            selected_channels: DmxChannelSelectionMask::default(),
+            last_channel: None,
+            select_mode: ChannelSelectionMode::Mono,
             slider_value: 0,
         }
     }
 
     #[inline]
-    pub fn get_colour(&self, address: DmxChannel) -> iced::Color {
-        mix(MIN_COLOUR, MAX_COLOUR, self.universe.get_channel(address) as f32 / u8::MAX as f32)
+    pub fn get_colour(&self, channel: DmxChannel) -> iced::Color {
+        mix(MIN_COLOUR, MAX_COLOUR, self.universe.get_channel(channel) as f32 / u8::MAX as f32)
     }
 }
 
+pub enum ChannelSelectionMode  {
+    Mono,
+    Poly,
+    Line
+}
+
 #[derive(Clone)]
-enum Message {
+pub enum Message {
     Reset,
-    SetChannel { channel: DmxChannel, value: u8 },
+    // SetChannel { channel: DmxChannel, value: u8 },
     SetSelectedChannels { value: u8 },
-    SelectChannel { channel: DmxChannel },
+    ClickChannel { channel: DmxChannel },
     DeselectChannels,
+    ToggleFullscreen,
     StartMultiChannelSelection,
     StopMultiChannelSelection,
     StartContiguousChannelSelection,
@@ -77,33 +86,77 @@ impl DMXDirect {
                 self.universe = DmxUniverse::default();
                 self.selected_channels.clear();
             }
-            Message::SetChannel { channel, value } => {
-                self.universe.set_channel(channel, value);
-            }
+            // Message::SetChannel { channel, value } => {
+            //     self.universe.set_channel(channel, value);
+            // }
             Message::SetSelectedChannels { value } => {
                 self.slider_value = value;
                 for channel in self.selected_channels.iter() {
-                    self.universe.set_channel(*channel, value);
+                    self.universe.set_channel(channel, value);
                 }
             }
             Message::DeselectChannels => {
                 self.selected_channels.clear();
             }
-            Message::SelectChannel { channel } => {
-                if self.multi_select {
-                    self.selected_channels.push(channel);
-                } else {
-                    self.selected_channels.clear();
-                    self.selected_channels.push(channel);
+            Message::ClickChannel { channel } => {
+                match self.select_mode {
+                    ChannelSelectionMode::Poly => {
+                        self.selected_channels.toggle(channel);
+                    }
+                    ChannelSelectionMode::Mono => {
+                        let contained = self.selected_channels.get(channel);
+                        self.selected_channels.clear();
+                        if !contained {
+                            self.selected_channels.set_true(channel);
+                        }
+                    }
+                    ChannelSelectionMode::Line => {
+                        match self.last_channel {
+                            None => {
+                                self.selected_channels.set_true(channel);
+                                self.last_channel = Some(channel);
+                            }
+
+                            Some(last) if last == channel => {
+                                self.selected_channels.toggle(channel);
+                            }
+
+                            Some(last) => {
+                                let (start, end) = if channel.raw() < last.raw() {
+                                    (channel.raw(), last.raw())
+                                } else {
+                                    (last.raw(), channel.raw())
+                                };
+
+                                for channel in start..=end {
+                                    // DmxChannel::new() is guaranteed to succeed here
+                                    // because both endpoints are valid DMX channels.
+                                    self.selected_channels
+                                        .set_true(DmxChannel::new(channel).unwrap());
+                                }
+
+                                self.last_channel = Some(channel);
+                            }
+                        }
+                    }
                 }
             }
             Message::StartMultiChannelSelection => {
-                self.multi_select = true;
+                self.select_mode = ChannelSelectionMode::Poly;
             }
             Message::StopMultiChannelSelection => {
-                self.multi_select = false;
+                self.select_mode = ChannelSelectionMode::Mono; // this unsetting here isnt great
             }
-            _ => {}
+            Message::StartContiguousChannelSelection => {
+                self.select_mode = ChannelSelectionMode::Line;
+            }
+            Message::StopContiguousChannelSelection => {
+                self.select_mode = ChannelSelectionMode::Mono; // ditto
+                self.last_channel = None;
+            }
+            Message::ToggleFullscreen => {
+                // iced makes this, apparently, not so simple
+            }
         }
     }
 
@@ -128,7 +181,7 @@ impl DMXDirect {
             let cells = (0..32).map(|x| {
                 let cell_channel = DmxChannel::new((y * 32 + x) + 1).unwrap(); // i mean its safe, but its not ideal
                 let cell_colour = self.get_colour(cell_channel);
-                let text_colour = if self.selected_channels.contains(&cell_channel) {
+                let text_colour = if self.selected_channels.get(cell_channel) {
                     iced::Color::from_rgb(0.0, 0.0, 1.0)
                 } else {
                     contrasting_color(cell_colour)
@@ -146,7 +199,7 @@ impl DMXDirect {
                 )
                     .padding(0)
                     .style(button::text)
-                    .on_press(Message::SelectChannel { channel: cell_channel })
+                    .on_press(Message::ClickChannel { channel: cell_channel })
                     .into()
             });
 
@@ -176,6 +229,9 @@ impl DMXDirect {
                     match key {
                         keyboard::Key::Named(keyboard::key::Named::Escape) => {
                             Some(Message::DeselectChannels)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::F11) => {
+                            Some(Message::ToggleFullscreen)
                         }
                         keyboard::Key::Named(keyboard::key::Named::Control) => {
                             Some(Message::StartMultiChannelSelection)
