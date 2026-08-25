@@ -1,6 +1,8 @@
 use iced::{
     theme::palette::mix,
+    Subscription,
     Background,
+    keyboard,
     Element,
     Length,
     Color,
@@ -14,87 +16,92 @@ use iced::{
     },
 };
 
+use crate::dmx::{DmxChannel, DmxUniverse};
+
+mod artnet;
+mod net;
+mod dmx;
+
 // kinda heatmap-based colouring, though still just placeholders for now
 pub const MIN_COLOUR: iced::Color = iced::Color::from_rgb(0.0, 0.0, 0.0);
 pub const MAX_COLOUR: iced::Color = iced::Color::from_rgb(1.0, 1.0, 1.0);
 
-pub struct DMXUniverse {
-    pub data: [u8; 512]
-}
-
-impl DMXUniverse {
-    pub const fn default() -> Self {
-        Self {
-            data: [0; 512]
-        }
-    }
-}
-
 fn main() -> iced::Result {
     iced::application(DMXDirect::default, DMXDirect::update, DMXDirect::view)
         .title("DMXDirect")
+        .subscription(DMXDirect::subscription)
         .run()
 }
 
 struct DMXDirect {
-    pub universe: DMXUniverse,
-    pub selected_channel: Option<u16>,
+    pub universe: DmxUniverse,
+    pub selected_channels: Vec<DmxChannel>,
+    pub multi_select: bool,
+    pub slider_value: u8,
 }
 
 impl DMXDirect {
     pub const fn default() -> Self {
         Self {
-            universe: DMXUniverse::default(),
-            selected_channel: None,
+            universe: DmxUniverse::default(),
+            selected_channels: Vec::new(),
+            multi_select: false,
+            slider_value: 0,
         }
     }
 
-    /// Sets an address within the DMX Universe.
-    /// Takes a human-indexed (1 -> 512) address number,
-    /// 
-    /// # Safety
-    /// Address must be within 1 and 512 (inclusive)
     #[inline]
-    pub fn set_address(&mut self, address: u16, value: u8) {
-        self.universe.data[(address - 1) as usize] = value;
-    }
-
-    #[inline]
-    pub fn get_address(&self, address: u16) -> u8 {
-        self.universe.data[(address - 1) as usize]
-    }
-
-    #[inline]
-    pub fn get_colour(&self, address: u16) -> iced::Color {
-        mix(MIN_COLOUR, MAX_COLOUR, self.get_address(address) as f32 / u8::MAX as f32)
+    pub fn get_colour(&self, address: DmxChannel) -> iced::Color {
+        mix(MIN_COLOUR, MAX_COLOUR, self.universe.get_channel(address) as f32 / u8::MAX as f32)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Message {
-    DummyOne,
     Reset,
-    DummyThree,
-    SetChannel { channel: u16, value: u8 },
-    SelectChannel { channel: u16 },
+    SetChannel { channel: DmxChannel, value: u8 },
+    SetSelectedChannels { value: u8 },
+    SelectChannel { channel: DmxChannel },
     DeselectChannels,
+    StartMultiChannelSelection,
+    StopMultiChannelSelection,
+    StartContiguousChannelSelection,
+    StopContiguousChannelSelection,
+    // delta change channel
 }
 
 impl DMXDirect {
     fn update(&mut self, message: Message) {
         match message {
             Message::Reset => {
-                self.universe = DMXUniverse::default();
-                self.selected_channel = None;
+                self.universe = DmxUniverse::default();
+                self.selected_channels.clear();
             }
             Message::SetChannel { channel, value } => {
-                self.set_address(channel, value);
+                self.universe.set_channel(channel, value);
+            }
+            Message::SetSelectedChannels { value } => {
+                self.slider_value = value;
+                for channel in self.selected_channels.iter() {
+                    self.universe.set_channel(*channel, value);
+                }
             }
             Message::DeselectChannels => {
-                self.selected_channel = None;
+                self.selected_channels.clear();
             }
             Message::SelectChannel { channel } => {
-                self.selected_channel = Some(channel)
+                if self.multi_select {
+                    self.selected_channels.push(channel);
+                } else {
+                    self.selected_channels.clear();
+                    self.selected_channels.push(channel);
+                }
+            }
+            Message::StartMultiChannelSelection => {
+                self.multi_select = true;
+            }
+            Message::StopMultiChannelSelection => {
+                self.multi_select = false;
             }
             _ => {}
         }
@@ -102,36 +109,38 @@ impl DMXDirect {
 
     fn view(&self) -> Element<'_, Message> {
         let mut toolbar = row([
-            button(text(format!("{:?}", self.selected_channel))).on_press(Message::DummyOne).into(),
             button(text("Reset")).on_press(Message::Reset).into(),
-            button(text("Set Output")).on_press(Message::DummyThree).into(),
+            button(text("Set Output")).into(),
         ])
         .spacing(8)
         .padding(8)
         .width(Length::Fill);
 
-        if let Some(channel) = self.selected_channel {
-            toolbar = toolbar.push(
-                slider(
-                    0..=255,
-                    self.get_address(channel),
-                    move |value| Message::SetChannel { channel, value },
-                ),
-            );
-        }
+        toolbar = toolbar.push(
+            slider(
+                0..=255,
+                self.slider_value,
+                move |value| Message::SetSelectedChannels { value },
+            ),
+        );
 
         let rows = (0..16).map(|y| {
             let cells = (0..32).map(|x| {
-                let cell_channel = (y * 32 + x) + 1;
-                let cell_color = self.get_colour(cell_channel);
+                let cell_channel = DmxChannel::new((y * 32 + x) + 1).unwrap(); // i mean its safe, but its not ideal
+                let cell_colour = self.get_colour(cell_channel);
+                let text_colour = if self.selected_channels.contains(&cell_channel) {
+                    iced::Color::from_rgb(0.0, 0.0, 1.0)
+                } else {
+                    contrasting_color(cell_colour)
+                };
 
-                button(container(text(cell_channel))
+                button(container(text(cell_channel.to_string()))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .center(Length::Fill)
                     .style(move |_theme| container::Style {
-                        background: Some(Background::Color(cell_color)),
-                        text_color: Some(contrasting_color(cell_color)),
+                        background: Some(Background::Color(cell_colour)),
+                        text_color: Some(text_colour),
                         ..Default::default()
                     })
                 )
@@ -158,6 +167,39 @@ impl DMXDirect {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        keyboard::listen().filter_map(|event| {
+            match event {
+                keyboard::Event::KeyPressed { key, .. } => {
+                    match key {
+                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                            Some(Message::DeselectChannels)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Control) => {
+                            Some(Message::StartMultiChannelSelection)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Shift) => {
+                            Some(Message::StartContiguousChannelSelection)
+                        }
+                        _ => None,
+                    }
+                }
+                keyboard::Event::KeyReleased { key, .. } => {
+                    match key {
+                        keyboard::Key::Named(keyboard::key::Named::Control) => {
+                            Some(Message::StopMultiChannelSelection)
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Shift) => {
+                            Some(Message::StopContiguousChannelSelection)
+                        }
+                        _ => None
+                    }
+                }
+                _ => None,
+            }
+        })
     }
 }
 
